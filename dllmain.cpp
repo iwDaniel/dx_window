@@ -13,11 +13,12 @@ using namespace Gdiplus;//如果没有
 static HINSTANCE  g_hDllInstance = NULL;   // DLL 自身模块句柄
 static ULONG_PTR  g_gdiplusToken = 0;
 static bool       g_inited = false;  // 是否已初始化
+
 static std::map<HWND, Bitmap*> g_bitmaps;
+static std::map<HWND, bool> g_draggable;
 static std::wstring g_title = L"GMPngWindow";
+
 static const wchar_t* CLASS_NAME = L"GMPngWindowClass";
-static HANDLE    g_hActCtx = INVALID_HANDLE_VALUE;
-static ULONG_PTR g_ulActCtxCookie = 0;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ================================================================
 // RenderLayeredWindow：把窗口对应的 Bitmap 用 alpha 混合绘制到屏幕上
@@ -261,6 +262,20 @@ static LRESULT CALLBACK PngWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         }
         return 0;
     }
+    case WM_NCHITTEST:
+    {
+        LRESULT hit = DefWindowProc(hWnd, msg, wParam, lParam);
+
+        // 查询该窗口是否启用了整窗拖动
+        auto it = g_draggable.find(hWnd);
+        if (it != g_draggable.end() && it->second)
+        {
+            // 只把【客户区】伪装成标题栏，非客户区（边框、按钮）保持原样
+            if (hit == HTCLIENT)
+                return HTCAPTION;
+        }
+        return hit;
+    }
     }
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
@@ -312,19 +327,6 @@ extern "C" {
             g_gdiplusToken = 0;
             return 0;
         }
-
-        
-
-
-
-
-
-
-
-
-
-
-
         g_inited = true;
         return 1.0;
     }
@@ -407,7 +409,7 @@ extern "C" {
 		//char buf[64];
         //sprintf_s(buf, "%d:%.2f", (int)hasBorder, hasBorder);
 		//MessageBoxA(NULL, buf, "Info", MB_OK);
-        if (hasBorder) style |= WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        if (hasBorder) style |= WS_CAPTION | WS_MINIMIZEBOX;
 
         DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW
             | WS_EX_NOACTIVATE;
@@ -437,8 +439,9 @@ extern "C" {
             delete bmp;
             return 0.0;
         }
-        // 3. 保存 Bitmap 指针
+        // 3. 保存 Bitmap/draggable/closeable 指针
         g_bitmaps[hWnd] = bmp;
+        g_draggable[hWnd] = false;
         // 6. 显示 + 绘制
         bool useLayered = (hasBorder == 0);
         ShowWindow(hWnd, SW_SHOWNOACTIVATE);
@@ -734,7 +737,39 @@ DX_SIDE double DX_SET_WINDOW_ZORDER(double hwndD,double hwnP)
 		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 	return ok ? 1.0 : 0.0;
 }
-  
+// ================================================================
+// DX_SET_DRAGGABLE：设置窗口是否可以用鼠标拖动任意位置
+// ================================================================
+// hwndD  : 窗口句柄
+// enable : 1 = 启用整窗拖动；0 = 只允许拖动标题栏
+// 返回   : 1 = 成功；0 = 失败
+// ================================================================
+DX_SIDE double __cdecl DX_SET_DRAGGABLE(double hwndD, double enable)
+{
+    if (!g_inited) return 0.0;
+
+    HWND hWnd = (HWND)(uintptr_t)hwndD;
+    if (!IsWindow(hWnd)) return 0.0;
+    if (g_bitmaps.find(hWnd) == g_bitmaps.end()) return 0.0;
+
+    g_draggable[hWnd] = (enable != 0.0);
+    return 1.0;
+}
+
+// ================================================================
+// DX_GET_DRAGGABLE：查询窗口是否启用整窗拖动
+// ================================================================
+DX_SIDE double __cdecl DX_GET_DRAGGABLE(double hwndD)
+{
+    if (!g_inited) return 0.0;
+
+    HWND hWnd = (HWND)(uintptr_t)hwndD;
+    if (!IsWindow(hWnd)) return 0.0;
+
+    auto it = g_draggable.find(hWnd);
+    if (it == g_draggable.end()) return 0.0;
+    return it->second ? 1.0 : 0.0;
+}
 
     
 
