@@ -276,6 +276,10 @@ static LRESULT CALLBACK PngWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         }
         return hit;
     }
+    case WM_CLOSE:
+    {
+        return 0;
+    }
     }
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
