@@ -39,22 +39,31 @@ static LRESULT CALLBACK PngWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         return 0;
     }
     Bitmap* bmp = it->second;
-    int w = (int)bmp->GetWidth();
-    int h = (int)bmp->GetHeight();
+    RECT rcClient;
+    GetClientRect(hWnd, &rcClient);
+    int cw = rcClient.right - rcClient.left;
+    int ch = rcClient.bottom - rcClient.top;
 
+    // 客户区为 0（如最小化）时直接跳过，避免创建 0×0 位图
+    if (cw <= 0 || ch <= 0)
+    {
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
     // ---- 双缓冲：先画到内存 DC ----
     HDC hdcMem = CreateCompatibleDC(hdc);
-    HBITMAP hbmMem = CreateCompatibleBitmap(hdc, w, h);
+    HBITMAP hbmMem = CreateCompatibleBitmap(hdc, cw, ch);
     HBITMAP hbmOld = (HBITMAP)SelectObject(hdcMem, hbmMem);
 
     {
         Graphics g(hdcMem);
         g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-        g.DrawImage(bmp, 0, 0, w, h);
-    }   // Graphics 析构，绘制完成
+        // 拉伸到整个客户区
+        g.DrawImage(bmp, 0, 0, cw, ch);
+    }
 
     // ---- 一次性贴到屏幕 ----
-    BitBlt(hdc, 0, 0, w, h, hdcMem, 0, 0, SRCCOPY);
+    BitBlt(hdc, 0, 0, cw, ch, hdcMem, 0, 0, SRCCOPY);
 
     // ---- 清理 ----
     SelectObject(hdcMem, hbmOld);
@@ -186,8 +195,8 @@ extern "C" {
         //sprintf_s(buf, "x=%d, y=%d", x, y);
         //MessageBoxA(NULL, buf, "params", MB_OK);
 		if (!g_inited) return 0.0;
-		//0. 转换 title 为宽字符串
-        int len = MultiByteToWideChar(CP_ACP, 0, imagePath, -1, NULL, 0);/////////////////////////////////
+		//0. 记录当前窗口
+        HWND hPrevForeground = GetForegroundWindow();
 		// 1. 加载 PNG 图片
         int pSize = MultiByteToWideChar(CP_ACP, 0, imagePath, -1, NULL, 0);
         if (pSize <= 0) return 0.0;
@@ -208,7 +217,7 @@ extern "C" {
 		DWORD style = WS_POPUP | WS_VISIBLE;
 		if (hasBorder) style |= WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 		HWND hWnd = CreateWindowEx(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
 			CLASS_NAME,
 			g_title.c_str(),
 			style,
@@ -228,6 +237,14 @@ extern "C" {
 		g_bitmaps[hWnd] = bmp;
         ShowWindow(hWnd, SW_SHOW);           // 再显示
         UpdateWindow(hWnd);
+
+        // 创建后把焦点还给原来的窗口
+        if (hPrevForeground && IsWindow(hPrevForeground))
+        {
+            SetForegroundWindow(hPrevForeground);
+            SetFocus(hPrevForeground);
+        }
+
 		return (double)(uintptr_t)hWnd; // 返回窗口句柄作为 double
 	}
     // ================================================================
@@ -294,10 +311,10 @@ extern "C" {
     DX_SIDE double __cdecl DX_SETTTL(const char* titleK)
     {
         if (!titleK) return 0.0;
-        int bufSize = MultiByteToWideChar(CP_ACP, 0, titleK, -1, NULL, 0);
+        int bufSize = MultiByteToWideChar(CP_UTF8, 0, titleK, -1, NULL, 0);
         if (bufSize <= 0) return 0.0;
         g_title.resize(bufSize);
-        MultiByteToWideChar(CP_ACP, 0, titleK, -1, &g_title[0], bufSize);
+        MultiByteToWideChar(CP_UTF8, 0, titleK, -1, &g_title[0], bufSize);
         // 去掉末尾 '\0'
         if (!g_title.empty() && g_title.back() == L'\0')
             g_title.pop_back();
@@ -318,14 +335,26 @@ DX_SIDE double __cdecl DX_SET_WINDOW_RECT(double hwndD, double x, double y, doub
         HWND hWnd = (HWND)(uintptr_t)hwndD;
         if (!IsWindow(hWnd)) return 0.0;
 
-        // SWP_NOZORDER   : 不改变 Z 序（不置顶也不置底）
-        // SWP_NOACTIVATE : 不抢焦点
+        if (w <= 0 || h <= 0) return 0.0;
+
+        // 把"客户区尺寸"换算成"窗口外框尺寸"
+        DWORD style = (DWORD)GetWindowLongPtr(hWnd, GWL_STYLE);
+        DWORD exStyle = (DWORD)GetWindowLongPtr(hWnd, GWL_EXSTYLE);
+
+        RECT rc = { 0, 0, (LONG)w, (LONG)h };
+        AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+        int winW = rc.right - rc.left;
+        int winH = rc.bottom - rc.top;
+
         BOOL ok = SetWindowPos(
-            hWnd,
-            NULL,
+            hWnd, NULL,
             (int)x, (int)y,
-            (int)w, (int)h,
+            winW, winH,
             SWP_NOZORDER | SWP_NOACTIVATE);
+
+        // 立即触发重绘，让图片按新客户区尺寸拉伸
+        InvalidateRect(hWnd, NULL, FALSE);
+        UpdateWindow(hWnd);
 
         return ok ? 1.0 : 0.0;
 }
@@ -354,7 +383,7 @@ DX_SIDE double __cdecl DX_CHANGE_IMAGE(double hwndD, const char* imagePath)
     std::wstring wPath(pSize, L'\0');
     MultiByteToWideChar(CP_ACP, 0, imagePath, -1, &wPath[0], pSize);
 
-    // 2. 加载新图片
+    // 2. 先加载新图片（成功后再替换，失败不影响原窗口）
     Bitmap* pNew = Bitmap::FromFile(wPath.c_str());
     if (!pNew || pNew->GetLastStatus() != Ok)
     {
@@ -365,13 +394,12 @@ DX_SIDE double __cdecl DX_CHANGE_IMAGE(double hwndD, const char* imagePath)
     // 3. 替换旧图片
     Bitmap* pOld = it->second;
     it->second = pNew;
-    delete pOld;   // 释放旧图
+    delete pOld;
 
-    // 4. 计算窗口新外框尺寸（考虑当前样式）
+    // 4. 以新图片的【原始尺寸】作为客户区尺寸
     int imgW = (int)pNew->GetWidth();
     int imgH = (int)pNew->GetHeight();
 
-    // 获取当前窗口样式和扩展样式
     DWORD style = (DWORD)GetWindowLongPtr(hWnd, GWL_STYLE);
     DWORD exStyle = (DWORD)GetWindowLongPtr(hWnd, GWL_EXSTYLE);
 
@@ -387,16 +415,16 @@ DX_SIDE double __cdecl DX_CHANGE_IMAGE(double hwndD, const char* imagePath)
     int curY = curRect.top;
 
     SetWindowPos(
-        hWnd,
-        NULL,
+        hWnd, NULL,
         curX, curY,
         winW, winH,
         SWP_NOZORDER | SWP_NOACTIVATE);
 
-    // 6. 立即刷新
+    // 6. 立即刷新：此时客户区尺寸 == 新图原始尺寸，图片显示为 1:1
     InvalidateRect(hWnd, NULL, FALSE);
     UpdateWindow(hWnd);
 
+    return 1.0;
     return 1.0;
 }
 
