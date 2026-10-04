@@ -10,10 +10,11 @@ DX_WINDOW是一个在GPL开源的库，任何人都可以使用和修改它。<b
 DX_WINDOW主要是为了练习C++,Windows API与复苏自己关于github的记忆，当然他90%都是vibe coding估计练不到哪去。(笑
 <br>有以下注意事项:
 1. 该库仅适用于gm8.1(2)版本，S以后好像可以在什么网站上找到比这个更好的;
-1. 注意所有的窗口都是强制置顶的，原因是因为为了符合我的需求;
-1. 一堆大便写法和一些混乱的代码风格，可能会让你看起来很不舒服;
-1. 卧槽vs副驾驶太牛逼了居然能帮我写readme，yeeeeeeeeeah;
-1. 哦对了pch.h没用，哈哈;
+1. 注意所有的窗口都是强制置顶的，原因是因为为了符合我的需求，如果你需要真正在gm8.x可配置的窗口，可以尝试maxWinAPI;
+1. 一堆大便写法和一些混乱的代码风格，可能会让你看起来想吐;
+1. **卧槽vs副驾驶太牛逼了居然能帮我写readme，yeeeeeeeeeah**;
+1. **哦对了pch没用，哈哈**;
+2. **哦对了这个库与DirectX没有任何关系，起这个b名字纯纯是因为我叫dx**;
 ### Thanks
 感谢以下人对DX_WINDOW的支持:<br>
  - 沙雕落衫([bilibili](https://space.bilibili.com/701084529)):制作了I wanna make a good trap game 4(+extra stage),I wanna wnk per second。这些作品对DX_WINDOW的开发提供了主要灵感和帮助。
@@ -23,5 +24,7 @@ DX_WINDOW主要是为了练习C++,Windows API与复苏自己关于github的记�
  - you;
 ### Todo
 1. 实例中可以看到同时改变窗口坐标和大小不平滑，将会尝试修复;
+2. 增加窗口Z序调整;
+3. 增加屏幕截图;
 1. 尝试增加对含有透明通道图片的支持;
 1. 写一个文档(最遥远);
