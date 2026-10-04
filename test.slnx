@@ -3,5 +3,8 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
+  <Folder Name="/解决方案项/">
+    <File Path="readme.md" />
+  </Folder>
   <Project Path="test.vcxproj" Id="b8dd6b3c-5c19-4b57-a4bf-9ab910b8a6a4" />
 </Solution>

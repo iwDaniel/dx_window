@@ -16,7 +16,178 @@ static bool       g_inited = false;  // 是否已初始化
 static std::map<HWND, Bitmap*> g_bitmaps;
 static std::wstring g_title = L"GMPngWindow";
 static const wchar_t* CLASS_NAME = L"GMPngWindowClass";
+static HANDLE    g_hActCtx = INVALID_HANDLE_VALUE;
+static ULONG_PTR g_ulActCtxCookie = 0;
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// ================================================================
+// RenderLayeredWindow：把窗口对应的 Bitmap 用 alpha 混合绘制到屏幕上
+// ================================================================
+// 这是分层窗口的核心：创建 32 位 DIB → GDI+ 绘制 → UpdateLayeredWindow
+// ================================================================
+static bool RenderLayeredWindow(HWND hWnd)
+{
+    auto it = g_bitmaps.find(hWnd);
+    if (it == g_bitmaps.end() || !it->second) return false;
 
+    Bitmap* pBmp = it->second;
+
+    // 1. 取客户区尺寸
+    RECT rcClient;
+    GetClientRect(hWnd, &rcClient);
+    int cw = rcClient.right - rcClient.left;
+    int ch = rcClient.bottom - rcClient.top;
+    if (cw <= 0 || ch <= 0) return false;
+
+    HDC hdcScreen = GetDC(NULL);
+    if (!hdcScreen) return false;
+
+    // 2. 创建 32 位 DIB（带 alpha 通道）
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = cw;
+    bmi.bmiHeader.biHeight = -ch;   // 负数 = 自上而下
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;    // 32 位，每像素 4 字节（BGRA）
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pBits = NULL;
+    HBITMAP hDib = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+    if (!hDib || !pBits)
+    {
+        ReleaseDC(NULL, hdcScreen);
+        return false;
+    }
+
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, hDib);
+
+    // 3. 用 GDI+ 把源图片画到 DIB 上（保留 alpha）
+    {
+        // 用 PixelFormat32bppPARGB（预乘 alpha）
+        Bitmap bmpDib(cw, ch, cw * 4, PixelFormat32bppPARGB, (BYTE*)pBits);
+        Graphics g(&bmpDib);
+        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        // SourceCopy：直接覆盖像素，不做混合，保留源图 alpha
+        g.SetCompositingMode(CompositingModeSourceCopy);
+        g.DrawImage(pBmp, 0, 0, cw, ch);
+    }
+
+    // 4. 取窗口当前屏幕位置
+    RECT rcWin;
+    GetWindowRect(hWnd, &rcWin);
+
+    POINT ptSrc = { 0, 0 };
+    POINT ptDst = { rcWin.left, rcWin.top };
+    SIZE  size = { cw, ch };
+    // AC_SRC_OVER + AC_SRC_ALPHA = 按源图 alpha 通道混合
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+
+    BOOL ok = UpdateLayeredWindow(
+        hWnd,
+        hdcScreen,
+        &ptDst, &size,
+        hdcMem, &ptSrc,
+        0, &bf,
+        ULW_ALPHA);
+
+    // 5. 清理
+    SelectObject(hdcMem, hOld);
+    DeleteObject(hDib);
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
+
+    return ok != FALSE;
+}
+
+
+/*
+static HRGN CreateRegionFromBitmap(Bitmap* bmp, BYTE alphaThreshold = 128)
+{
+    if (!bmp) return NULL;
+
+    int w = (int)bmp->GetWidth();
+    int h = (int)bmp->GetHeight();
+    if (w <= 0 || h <= 0) return NULL;
+
+    Rect rect(0, 0, w, h);
+    BitmapData data;
+    if (bmp->LockBits(&rect, ImageLockModeRead, PixelFormat32bppARGB, &data) != Ok)
+        return NULL;
+
+    BYTE* scan0 = (BYTE*)data.Scan0;
+    int   stride = data.Stride;
+
+    HRGN hTotal = CreateRectRgn(0, 0, 0, 0);
+
+    for (int y = 0; y < h; ++y)
+    {
+        BYTE* row = scan0 + y * stride;
+        int xStart = -1;
+
+        for (int x = 0; x < w; ++x)
+        {
+            BYTE alpha = row[x * 4 + 3];
+            bool opaque = (alpha >= alphaThreshold);
+
+            if (opaque && xStart < 0)
+            {
+                xStart = x;
+            }
+            else if (!opaque && xStart >= 0)
+            {
+                HRGN hRow = CreateRectRgn(xStart, y, x, y + 1);
+                CombineRgn(hTotal, hTotal, hRow, RGN_OR);
+                DeleteObject(hRow);
+                xStart = -1;
+            }
+        }
+        if (xStart >= 0)
+        {
+            HRGN hRow = CreateRectRgn(xStart, y, w, y + 1);
+            CombineRgn(hTotal, hTotal, hRow, RGN_OR);
+            DeleteObject(hRow);
+        }
+    }
+
+    bmp->UnlockBits(&data);
+    return hTotal;
+}
+static HRGN CreateRegionForBorderedWindow(HWND hWnd, Bitmap* bmp, BYTE threshold)
+{
+    // 1. 取客户区相对窗口的偏移
+    POINT ptClient = { 0, 0 };
+    ClientToScreen(hWnd, &ptClient);   // 客户区左上角的屏幕坐标
+    RECT rcWin;
+    GetWindowRect(hWnd, &rcWin);
+    int offsetX = ptClient.x - rcWin.left;   // 客户区相对窗口的 X 偏移
+    int offsetY = ptClient.y - rcWin.top;    // 客户区相对窗口的 Y 偏移（≈ 标题栏高度）
+
+    // 2. 从图片 alpha 生成区域（客户区坐标）
+    HRGN hImgRgn = CreateRegionFromBitmap(bmp, threshold);
+    if (!hImgRgn) return NULL;
+
+    // 3. 把图片区域偏移到窗口坐标
+    OffsetRgn(hImgRgn, offsetX, offsetY);
+
+    // 4. 构造标题栏 + 边框矩形（覆盖整个非客户区）
+    RECT rcClient;
+    GetClientRect(hWnd, &rcClient);
+    int winW = rcWin.right - rcWin.left;
+    int winH = rcWin.bottom - rcWin.top;
+
+    // 标题栏矩形：从窗口顶部到客户区顶部
+    HRGN hCaption = CreateRectRgn(0, 0, winW, offsetY);
+
+    // 合并：标题栏 + 偏移后的图片区域
+    HRGN hTotal = CreateRectRgn(0, 0, 0, 0);
+    CombineRgn(hTotal, hCaption, hImgRgn, RGN_OR);
+
+    DeleteObject(hImgRgn);
+    DeleteObject(hCaption);
+    return hTotal;
+}*/
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // ---------------- 窗口过程 ----------------
 static LRESULT CALLBACK PngWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -29,7 +200,13 @@ static LRESULT CALLBACK PngWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
     {
         PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hWnd, &ps);
-
+    DWORD exStyle = (DWORD)GetWindowLongPtr(hWnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_LAYERED)
+    {   
+        //MessageBoxA(NULL, "Layered window", "Info", MB_OK);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
 
 
     auto it = g_bitmaps.find(hWnd);
@@ -117,7 +294,7 @@ extern "C" {
         GdiplusStartupInput input;
         if (GdiplusStartup(&g_gdiplusToken, &input, NULL) != Ok)
             return 0;
-
+        //1.1. 激活上下文，确保使用 DLL 内嵌的 ComCtl32 v6 资源（没啦哈哈哈）
         // 2. 注册窗口类（使用 DLL 自己的 HINSTANCE）
         WNDCLASSEX wc = {};
         wc.cbSize = sizeof(WNDCLASSEX);
@@ -135,6 +312,18 @@ extern "C" {
             g_gdiplusToken = 0;
             return 0;
         }
+
+        
+
+
+
+
+
+
+
+
+
+
 
         g_inited = true;
         return 1.0;
@@ -174,7 +363,7 @@ extern "C" {
         // 3. 重置状态
         g_inited = false;
         g_title = L"GMPngWindow";
-
+		//3.关闭激活上下文 
         // 注意：窗口类已注册，Windows 没有反注册 API，
         //       进程退出时系统会自动释放，无需处理。
 
@@ -190,14 +379,14 @@ extern "C" {
 // 返回      : 窗口句柄（HWND）；失败返回 0
 // ================================================================
     DX_SIDE double DX_CREATE_PNG_WINDOW(const char* imagePath, double x, double y, double hasBorder)
-	{   
-        char buf[64];
+    {
+        //char buf[64];
         //sprintf_s(buf, "x=%d, y=%d", x, y);
         //MessageBoxA(NULL, buf, "params", MB_OK);
-		if (!g_inited) return 0.0;
-		//0. 记录当前窗口
+        if (!g_inited) return 0.0;
+        //0. 记录当前窗口
         HWND hPrevForeground = GetForegroundWindow();
-		// 1. 加载 PNG 图片
+        // 1. 加载 PNG 图片
         int pSize = MultiByteToWideChar(CP_ACP, 0, imagePath, -1, NULL, 0);
         if (pSize <= 0) return 0.0;
         std::wstring wImagePath(pSize, L'\0');
@@ -213,31 +402,55 @@ extern "C" {
             delete bmp;
             return 0.0;
         }
-		// 2. 创建窗口
-		DWORD style = WS_POPUP | WS_VISIBLE;
-		if (hasBorder) style |= WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-		HWND hWnd = CreateWindowEx(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-			CLASS_NAME,
-			g_title.c_str(),
-			style,
-			x, y,
-			bmp->GetWidth(),
-			bmp->GetHeight(),
-			NULL,
-			NULL,
-			g_hDllInstance,
-			NULL);
-		if (!hWnd)
-		{
-			delete bmp;
-			return 0.0;
-		}
-		// 3. 保存 Bitmap 指针
-		g_bitmaps[hWnd] = bmp;
-        ShowWindow(hWnd, SW_SHOW);           // 再显示
-        UpdateWindow(hWnd);
+        // 2. 创建窗口
+        DWORD style = WS_POPUP;
+		//char buf[64];
+        //sprintf_s(buf, "%d:%.2f", (int)hasBorder, hasBorder);
+		//MessageBoxA(NULL, buf, "Info", MB_OK);
+        if (hasBorder) style |= WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 
+        DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+            | WS_EX_NOACTIVATE;
+        if (hasBorder == 0)
+        {
+            exStyle |= WS_EX_LAYERED;
+        }
+
+        // 3. ★ 用 AdjustWindowRectEx 把图片尺寸换算成外框尺寸
+        RECT rc = { 0, 0, (LONG)bmp->GetWidth(), (LONG)bmp->GetHeight() };
+        AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+        int winW = rc.right - rc.left;
+        int winH = rc.bottom - rc.top;
+        //DWORD style = WS_POPUP;
+        //if (hasBorder) style |= WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        HWND hWnd = CreateWindowEx(
+            exStyle,
+            CLASS_NAME,
+            g_title.c_str(),
+            style,
+            (int)x, (int)y,
+            winW, winH,
+            NULL, NULL,
+            g_hDllInstance, NULL);
+        if (!hWnd)
+        {
+            delete bmp;
+            return 0.0;
+        }
+        // 3. 保存 Bitmap 指针
+        g_bitmaps[hWnd] = bmp;
+        // 6. 显示 + 绘制
+        bool useLayered = (hasBorder == 0);
+        ShowWindow(hWnd, SW_SHOWNOACTIVATE);
+        if (useLayered)
+        {        RenderLayeredWindow(hWnd);
+    }      // 分层：UpdateLayeredWindow
+        else
+        {   // 有边框 → 设置二值透明区域
+        
+            InvalidateRect(hWnd, NULL, FALSE);   
+            UpdateWindow(hWnd);
+        }
         // 创建后把焦点还给原来的窗口
         if (hPrevForeground && IsWindow(hPrevForeground))
         {
@@ -260,9 +473,17 @@ extern "C" {
         for (auto& kv : g_bitmaps)
         {
             HWND hWnd = kv.first;
-            //if (!IsWindow(hWnd)) continue;
-            InvalidateRect(hWnd, NULL, FALSE);
-            UpdateWindow(hWnd);   // 立即触发 WM_PAINT
+            if (!IsWindow(hWnd)) continue;
+            DWORD exStyle = (DWORD)GetWindowLongPtr(hWnd, GWL_EXSTYLE);
+            if (exStyle & WS_EX_LAYERED)
+            {
+                RenderLayeredWindow(hWnd);
+            }
+            else
+            {
+                InvalidateRect(hWnd, NULL, FALSE);
+                UpdateWindow(hWnd);
+            }   // 立即触发 WM_PAINT
             count++;
         }
         return (double)count;
@@ -308,16 +529,27 @@ extern "C" {
     // ================================================================
 // DX_SETTTL：设置窗口标题
 // ================================================================
-    DX_SIDE double __cdecl DX_SETTTL(const char* titleK)
+    DX_SIDE double __cdecl DX_SETTTL(double hwndD, const char* titleK)
     {
         if (!titleK) return 0.0;
+        HWND hWnd = (HWND)(uintptr_t)hwndD;
+        if (!IsWindow(hWnd)) return 0.0;
+        if (g_bitmaps.find(hWnd) == g_bitmaps.end()) return 0.0;
+
+        // UTF-8 → 宽字符
         int bufSize = MultiByteToWideChar(CP_UTF8, 0, titleK, -1, NULL, 0);
         if (bufSize <= 0) return 0.0;
-        g_title.resize(bufSize);
-        MultiByteToWideChar(CP_UTF8, 0, titleK, -1, &g_title[0], bufSize);
-        // 去掉末尾 '\0'
-        if (!g_title.empty() && g_title.back() == L'\0')
-            g_title.pop_back();
+
+        std::wstring wTitle(bufSize, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, titleK, -1, &wTitle[0], bufSize);
+        if (!wTitle.empty() && wTitle.back() == L'\0')
+            wTitle.pop_back();
+
+        // 真正设置窗口标题
+        SetWindowTextW(hWnd, wTitle.c_str());
+
+        // 同时更新全局默认标题（下次创建窗口时使用）
+        g_title = wTitle;
         return (double)bufSize;
     }
     // ================================================================
@@ -340,7 +572,12 @@ DX_SIDE double __cdecl DX_SET_WINDOW_RECT(double hwndD, double x, double y, doub
         // 把"客户区尺寸"换算成"窗口外框尺寸"
         DWORD style = (DWORD)GetWindowLongPtr(hWnd, GWL_STYLE);
         DWORD exStyle = (DWORD)GetWindowLongPtr(hWnd, GWL_EXSTYLE);
-
+		//如果不是分层窗口，先清除原来的区域，否则 SetWindowRgn 会失败
+        bool isLayered = (exStyle & WS_EX_LAYERED) != 0;
+        if (!isLayered)
+        {
+            SetWindowRgn(hWnd, NULL, FALSE);   // 清除区域，FALSE = 暂不重绘
+        }
         RECT rc = { 0, 0, (LONG)w, (LONG)h };
         AdjustWindowRectEx(&rc, style, FALSE, exStyle);
         int winW = rc.right - rc.left;
@@ -420,18 +657,86 @@ DX_SIDE double __cdecl DX_CHANGE_IMAGE(double hwndD, const char* imagePath)
         winW, winH,
         SWP_NOZORDER | SWP_NOACTIVATE);
 
-    // 6. 立即刷新：此时客户区尺寸 == 新图原始尺寸，图片显示为 1:1
-    InvalidateRect(hWnd, NULL, FALSE);
-    UpdateWindow(hWnd);
+    //DWORD exStyle = (DWORD)GetWindowLongPtr(hWnd, GWL_EXSTYLE);
 
+    if (exStyle & WS_EX_LAYERED)
+    {
+        // 分层窗口：用 UpdateLayeredWindow
+        RenderLayeredWindow(hWnd);
+    }
+    else
+    {
+        
+
+        InvalidateRect(hWnd, NULL, FALSE);
+        UpdateWindow(hWnd);
+    }
     return 1.0;
     return 1.0;
+}// ================================================================
+// DX_GET_WINDOW_RECT：获取窗口位置与大小
+// ================================================================
+// hwndD : DX_CREATE_PNG_WINDOW 返回的窗口句柄（double）
+// type: 输出参数(0:x, 1:y, 2:w, 3:h)
+// 返回  : type对应的值
+// ================================================================
+DX_SIDE double __cdecl DX_GET_WINDOW_RECT(double hwndD, double* type)
+{
+    if (!g_inited) return 0.0;
+    if (!type || *type < 0 || *type > 3 || *type != (int)*type) return -1.0;
+    
+    HWND hWnd = (HWND)(uintptr_t)hwndD;
+    if (!IsWindow(hWnd)) return 0.0;
+
+    RECT rc;
+    GetWindowRect(hWnd, &rc);
+	double result = 0.0;
+    switch ((int)*type) {
+    case 0:
+        result = (double)rc.left;
+        break;
+    case 1:
+        result = (double)rc.top;
+        break;
+    case 2:
+        result = (double)(rc.right - rc.left);
+        break;
+    case 3:
+        result = (double)(rc.bottom - rc.top);
+        break;
+    default:
+        return -1.0;
+    }
+    return result;
 }
+// ================================================================
+// DX_SET_WINDOW_ZORDER：将窗口插入到指定窗口之后
+// ================================================================
+// hwndD : DX_CREATE_PNG_WINDOW 返回的窗口句柄（double）
+// hwnP: 参考窗口句柄（double）
+// 返回  : 操作是否成功
+// ================================================================
+DX_SIDE double DX_SET_WINDOW_ZORDER(double hwndD,double hwnP)
+{
+	if (!g_inited) return 0.0;
+	HWND hWnd = (HWND)(uintptr_t)hwndD;
+    HWND hInsertAfter = NULL; 
+    if (hwnP != 0 ) { hInsertAfter = (HWND)(uintptr_t)hwnP;
+    
+    }
+    else {
+		return -1.0;
+    };
 
+	BOOL ok = SetWindowPos(
+		hWnd, hInsertAfter,
+		0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+	return ok ? 1.0 : 0.0;
+}
+  
 
-
-
-
+    
 
 
 
